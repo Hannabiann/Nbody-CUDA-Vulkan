@@ -274,7 +274,7 @@ void drawFrame() {
         fps = frames * 1000.0f / (time_f - timebase); timebase = time_f; frames = 0;
         const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
         char res[100];
-        std::snprintf(res, sizeof(res), "Nbody V3.2.1 | Method: %s | True Zero-Copy FPS: %.3f", name_method, fps);
+        std::snprintf(res, sizeof(res), "Nbody V4.0 | Method: %s | True Zero-Copy FPS: %.3f", name_method, fps);
         glfwSetWindowTitle(window, res);
     }
     updateVertexBuffer();
