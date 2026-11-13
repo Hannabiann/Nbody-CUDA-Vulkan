@@ -17,3 +17,11 @@ __Windows__
 | RTX 4060 (Tile) | ~ 1084 | ~ 81 |
 | RTX 4090 (Force) | ~ 1300 | ~ 265 |
 | RTX 4090 (Tile) | ~ 2390 | ~ 408 |
+
+__Linux (CachyOS)__
+| Device/Mode | N=16000 (FPS) | N=64000 (FPS) |
+| :--- | :---: | :---: |
+| Ryzen 7700 (AVX-512) | ~ 130 | ~ 8 |
+| Ryzen 7700 (AVX-2) | ~ 109 | ~ 7 |
+| RTX 4070 (Tile) | ~ 1720 | ~ 157 |
+| RTX 4070 (Force) | ~ 1075 | ~ 93 |
