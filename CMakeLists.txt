@@ -1,47 +1,44 @@
-cmake_minimum_required(VERSION 3.20)
-project(NbodyVulkan LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.24)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;100-real;120")
 endif()
 
-# Архитектура Ada Lovelace (RTX 4090 = sm_89)
-set(CMAKE_CUDA_ARCHITECTURES 89)
+project(Nbody_CUDA VERSION 4.2.0 LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# Статическая линковка рантайма CUDA (чтобы бинарник запускался даже на ПК без драйвера NVIDIA)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 find_package(Vulkan REQUIRED)
-find_package(OpenMP REQUIRED)
-find_package(CUDAToolkit REQUIRED)
 find_package(glfw3 REQUIRED)
+find_package(OpenMP REQUIRED)
 
-add_executable(nbody_vulkan
+add_executable(Nbody_CUDA
     main.cpp
     draw.cpp
     calc_switch.cpp
     generator.cpp
     openmp.cpp
-    cuda.cu
     init.cu
+    cuda.cu
 )
 
-# Настройка флагов компиляции
-target_compile_options(nbody_vulkan PRIVATE
-    # Флаги для C++ (CPU): O3, Zen 4 (AVX-512), быстрая математика и отчет о векторизации
-    $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=znver4 -ffast-math -fopt-info-vec-optimized -DNDEBUG>
+target_include_directories(Nbody_CUDA PRIVATE src)
 
-    # Флаги для CUDA (GPU + Host): O3, fast math для GPU и проброс флагов в g++
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG --compiler-options=-O3,-march=znver4,-ffast-math>
+# Флаги оптимизации для C++ (CPU) и NVCC (GPU)
+target_compile_options(Nbody_CUDA PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -ffast-math -DNDEBUG -march=native -ffast-math -fopt-info-vec-optimized -funroll-loops -DNDEBUG>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG --compiler-options=-O3,-march=native,-ffast-math>
 )
 
-# Включение LTO (Link Time Optimization)
-set_property(TARGET nbody_vulkan PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-
-target_link_libraries(nbody_vulkan PRIVATE
+target_link_libraries(Nbody_CUDA PRIVATE
     Vulkan::Vulkan
-    OpenMP::OpenMP_CXX
-    CUDA::cudart
     glfw
+    OpenMP::OpenMP_CXX
+    ${CMAKE_DL_LIBS}
 )
