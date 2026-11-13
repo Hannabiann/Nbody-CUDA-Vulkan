@@ -392,12 +392,7 @@ void drawFrame() {
 
     if (time_f - timebase >= 1000.0f) {
         fps = frames * 1000.0f / (time_f - timebase); timebase = time_f; frames = 0;
-        const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
-        const char* state_str = isPaused ? " [PAUSED]" : "";
-        char res[140];
-        std::snprintf(res, sizeof(res), APP_TITLE " | Method: %s | Speed: %.2fx | FPS: %.3f%s",
-            name_method, simSpeed, fps, state_str);
-        glfwSetWindowTitle(window, res);
+        updateWindowTitle();
     }
     updateVertexBuffer();
 }
