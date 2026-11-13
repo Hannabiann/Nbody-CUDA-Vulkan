@@ -38,11 +38,13 @@ extern "C" {
 VkBuffer vertexBuffer = VK_NULL_HANDLE;
 VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
 VkDeviceSize vertexBufferAllocSize = 0;
+void* pMappedPosData = nullptr; // Используется, когда CUDA недоступна
 
 VkBuffer colorBuffer = VK_NULL_HANDLE;
 VkDeviceMemory colorBufferMemory = VK_NULL_HANDLE;
 
 static float x_angle = 0.0f, y_angle = 0.0f;
+static float view_zoom = 6000.0f;
 static float fps = 0.0f, time_f = 0.0f, timebase = 0.0f;
 static int frames = 0;
 
@@ -57,6 +59,7 @@ bool checkDataChanged() { return dataChanged; }
 void clearDataChangedFlag() { dataChanged = false; }
 float getXAngle() { return x_angle; }
 float getYAngle() { return y_angle; }
+float getZoom() { return view_zoom; }
 VkBuffer getColorBuffer() { return colorBuffer; }
 void* getCpuVerticesPointer() { return cpuPositions.empty() ? nullptr : cpuPositions.data(); }
 
@@ -107,14 +110,41 @@ void MousePressedMove(GLFWwindow* window, double xpos, double ypos) {
     else { firstMouse = true; }
 }
 
+void MouseScroll(GLFWwindow* window, double xoffset, double yoffset) {
+    if (yoffset < 0)
+        view_zoom *= 1.15f;
+    else if (yoffset > 0)
+        view_zoom /= 1.15f;
+
+    if (view_zoom < 500.0f) view_zoom = 500.0f;
+}
+
 void keyboardPressed(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action == GLFW_PRESS) {
         switch (key) {
-        case GLFW_KEY_1: button = 1; break;
-        case GLFW_KEY_2: button = 2; break;
-        case GLFW_KEY_3: button = 3; break;
+        case GLFW_KEY_1:
+            button = 1;
+            dataChanged = true;
+            break;
+        case GLFW_KEY_2:
+            if (hasCuda) {
+                button = 2;
+                dataChanged = true;
+            }
+            else {
+                std::cout << "[CUDA Unavailable] Running in CPU (OpenMP) mode.\n";
+            }
+            break;
+        case GLFW_KEY_3:
+            if (hasCuda) {
+                button = 3;
+                dataChanged = true;
+            }
+            else {
+                std::cout << "[CUDA Unavailable] Running in CPU (OpenMP) mode.\n";
+            }
+            break;
         }
-        dataChanged = true;
     }
 }
 
@@ -170,9 +200,25 @@ void createVertexBuffer() {
     cpuPositions.clear(); cpuColors.clear();
     cpuPositions.reserve(N + 200); cpuColors.reserve(N + 200);
 
+    int N_large = (N * 3) / 4;
+    int bulgeLarge = N_large / 7;
+    int bulgeSmall = (N - N_large) / 7;
+
     for (int i = 0; i < N; i++) {
         cpuPositions.push_back({ POSX[i], POSY[i], POSZ[i] });
-        cpuColors.push_back({ 1.0f, 1.0f, 1.0f });
+
+        if (i < N_large) {
+            if (i < bulgeLarge)
+                cpuColors.push_back({ 1.0f, 0.85f, 0.45f });
+            else
+                cpuColors.push_back({ 0.55f, 0.80f, 1.0f });
+        }
+        else {
+            if (i - N_large < bulgeSmall)
+                cpuColors.push_back({ 1.0f, 0.70f, 0.35f });
+            else
+                cpuColors.push_back({ 0.75f, 0.95f, 0.90f });
+        }
     }
 
     const float AXIS_LENGTH = 3800.0f; const float AXIS_OFFSET = 2000.0f;
@@ -198,7 +244,13 @@ void createVertexBuffer() {
     g_vertexCount = cpuPositions.size();
 
     if (vertexBuffer != VK_NULL_HANDLE) {
-        GPU_UnregisterVulkanBuffer();
+        if (hasCuda) {
+            GPU_UnregisterVulkanBuffer();
+        }
+        else if (pMappedPosData != nullptr) {
+            vkUnmapMemory(device, vertexBufferMemory);
+            pMappedPosData = nullptr;
+        }
         vkDestroyBuffer(device, vertexBuffer, nullptr); vkFreeMemory(device, vertexBufferMemory, nullptr);
         vkDestroyBuffer(device, colorBuffer, nullptr); vkFreeMemory(device, colorBufferMemory, nullptr);
     }
@@ -206,28 +258,43 @@ void createVertexBuffer() {
     VkDeviceSize posSize = sizeof(Vec3) * g_vertexCount;
     VkDeviceSize colorSize = sizeof(Vec3) * g_vertexCount;
 
-    vertexBufferAllocSize = helperCreateBuffer(
-        posSize,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        vertexBuffer,
-        vertexBufferMemory,
-        true
-    );
+    if (hasCuda) {
+        // Режим с поддержкой CUDA: буфер в DEVICE_LOCAL памяти и экспорт в CUDA
+        vertexBufferAllocSize = helperCreateBuffer(
+            posSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            vertexBuffer,
+            vertexBufferMemory,
+            true
+        );
 
 #ifdef _WIN32
-    HANDLE win32Handle = getVulkanBufferMemoryHandle();
-    if (win32Handle != nullptr) {
-        GPU_RegisterVulkanBuffer(win32Handle, (size_t)vertexBufferAllocSize, cpuPositions.data(), (size_t)posSize);
-        CloseHandle(win32Handle);
-    }
+        HANDLE win32Handle = getVulkanBufferMemoryHandle();
+        if (win32Handle != nullptr) {
+            GPU_RegisterVulkanBuffer(win32Handle, (size_t)vertexBufferAllocSize, cpuPositions.data(), (size_t)posSize);
+            CloseHandle(win32Handle);
+        }
 #else
-    int fd = getVulkanBufferMemoryFd();
-    if (fd != -1) {
-        // На Linux драйвер CUDA сам забирает владение дескриптором fd при импорте
-        GPU_RegisterVulkanBuffer(fd, (size_t)vertexBufferAllocSize, cpuPositions.data(), (size_t)posSize);
-    }
+        int fd = getVulkanBufferMemoryFd();
+        if (fd != -1) {
+            GPU_RegisterVulkanBuffer(fd, (size_t)vertexBufferAllocSize, cpuPositions.data(), (size_t)posSize);
+        }
 #endif
+    }
+    else {
+        // Режим без CUDA: обычный HOST_VISIBLE буфер для прямого доступа с CPU
+        vertexBufferAllocSize = helperCreateBuffer(
+            posSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            vertexBuffer,
+            vertexBufferMemory,
+            false
+        );
+        vkMapMemory(device, vertexBufferMemory, 0, posSize, 0, &pMappedPosData);
+        std::memcpy(pMappedPosData, cpuPositions.data(), (size_t)posSize);
+    }
 
     helperCreateBuffer(
         colorSize,
@@ -249,16 +316,29 @@ void createVertexBuffer() {
 void updateVertexBuffer() {
     if (!bufferCreated) { createVertexBuffer(); return; }
 
-    // В режимах CUDA (button == 2 или 3) буфер обновляется напрямую в VRAM
-    if (button != 1) return;
+    // Если работает CUDA (кнопки 2 или 3), вершины обновляются напрямую в VRAM
+    if (hasCuda && button != 1) return;
 
+    if (hasCuda) {
+        // CPU OpenMP на компьютере с CUDA
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < N; i++) {
-        cpuPositions[i].x = POSX[i];
-        cpuPositions[i].y = POSY[i];
-        cpuPositions[i].z = POSZ[i];
+        for (int i = 0; i < N; i++) {
+            cpuPositions[i].x = POSX[i];
+            cpuPositions[i].y = POSY[i];
+            cpuPositions[i].z = POSZ[i];
+        }
+        GPU_UpdateVulkanBufferFromHost(cpuPositions.data(), N * sizeof(Vec3));
     }
-    GPU_UpdateVulkanBufferFromHost(cpuPositions.data(), N * sizeof(Vec3));
+    else if (pMappedPosData != nullptr) {
+        // CPU OpenMP на компьютере без CUDA (прямая запись в память Vulkan)
+        Vec3* posData = static_cast<Vec3*>(pMappedPosData);
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; i++) {
+            posData[i].x = POSX[i];
+            posData[i].y = POSY[i];
+            posData[i].z = POSZ[i];
+        }
+    }
 }
 
 void markDataChanged() { dataChanged = true; }
@@ -274,14 +354,20 @@ void drawFrame() {
         fps = frames * 1000.0f / (time_f - timebase); timebase = time_f; frames = 0;
         const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
         char res[100];
-        std::snprintf(res, sizeof(res), "Nbody V4.0 | Method: %s | True Zero-Copy FPS: %.3f", name_method, fps);
+        std::snprintf(res, sizeof(res), "Nbody V4.1 | Method: %s | FPS: %.3f", name_method, fps);
         glfwSetWindowTitle(window, res);
     }
     updateVertexBuffer();
 }
 
 void cleanupVertexBuffer() {
-    GPU_UnregisterVulkanBuffer();
+    if (hasCuda) {
+        GPU_UnregisterVulkanBuffer();
+    }
+    else if (pMappedPosData != nullptr && vertexBufferMemory != VK_NULL_HANDLE) {
+        vkUnmapMemory(device, vertexBufferMemory);
+        pMappedPosData = nullptr;
+    }
 
     if (vertexBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(device, vertexBuffer, nullptr);

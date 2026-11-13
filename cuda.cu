@@ -47,6 +47,8 @@ __global__ void NbodyForceKernelOptimized(
     float fy = posy[first];
     float fz = posz[first];
 
+    const float eps2 = EPS * EPS;
+
 #pragma unroll 16
     for (unsigned int next = 0; next < N; next++) {
         float det_X = posx[next] - fx;
@@ -54,7 +56,7 @@ __global__ void NbodyForceKernelOptimized(
         float det_Z = posz[next] - fz;
 
         float norm = det_X * det_X + det_Y * det_Y + det_Z * det_Z;
-        float ext = norm * norm + EPS * EPS;
+        float ext = norm + eps2;
 
         float inv_dist = rsqrtf(ext);
         float den = (grav * posm[next]) * (inv_dist * inv_dist * inv_dist);
@@ -119,7 +121,9 @@ __global__ void NbodyTileKernelOptimized(
         __syncthreads();
 
         if (first < N) {
-#pragma unroll 16
+            const float eps2 = EPS * EPS;
+
+        #pragma unroll 16
             for (unsigned int j = 0; j < BLOCK_SIZE; j++) {
                 if (tile * BLOCK_SIZE + j >= N) break;
 
@@ -128,7 +132,7 @@ __global__ void NbodyTileKernelOptimized(
                 float det_Z = sh_z[j] - fz;
 
                 float norm = det_X * det_X + det_Y * det_Y + det_Z * det_Z;
-                float ext = norm * norm + EPS * EPS;
+                float ext = norm + eps2;
 
                 float inv_dist = rsqrtf(ext);
                 float den = (grav * sh_m[j]) * (inv_dist * inv_dist * inv_dist);

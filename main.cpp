@@ -41,6 +41,8 @@ extern void keyboardPressed(GLFWwindow* window, int key, int scancode, int actio
 extern void createVertexBuffer();
 extern float getXAngle();
 extern float getYAngle();
+extern float getZoom();
+extern void MouseScroll(GLFWwindow* window, double xoffset, double yoffset);
 
 extern void cudaInitDevices();
 extern void generateWorld();
@@ -84,6 +86,7 @@ size_t g_vertexCount = 0;
 struct PushConstants {
     float x_angle;
     float y_angle;
+    float zoom;
 };
 
 VkShaderModule createShaderModule(const uint32_t* code, size_t sizeInBytes) {
@@ -103,7 +106,7 @@ void createInstance() {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Nbody";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 2, 1);
+    appInfo.applicationVersion = VK_MAKE_VERSION(4, 1, 0);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -112,8 +115,10 @@ void createInstance() {
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
     std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
-    extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
-    extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    if (hasCuda) {
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    }
 
     VkInstanceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -126,7 +131,9 @@ void createInstance() {
         throw std::runtime_error("Failed to create Vulkan instance!");
     }
 
-    initVulkanExtensions(instance);
+    if (hasCuda) {
+        initVulkanExtensions(instance);
+    }
 }
 
 void createSurface() {
@@ -194,23 +201,23 @@ void createLogicalDevice() {
 
     VkPhysicalDeviceFeatures deviceFeatures{};
 
-    const char* extensions[] = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+    std::vector<const char*> extensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    if (hasCuda) {
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
 #ifdef _WIN32
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 #else
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
 #endif
-    };
+    }
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.pQueueCreateInfos = &queueCreateInfo;
     createInfo.queueCreateInfoCount = 1;
     createInfo.pEnabledFeatures = &deviceFeatures;
-    createInfo.enabledExtensionCount = 3;
-    createInfo.ppEnabledExtensionNames = extensions;
+    createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+    createInfo.ppEnabledExtensionNames = extensions.data();
     createInfo.enabledLayerCount = 0;
 
     if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS) {
@@ -603,6 +610,7 @@ void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
         PushConstants constants;
         constants.x_angle = getXAngle();
         constants.y_angle = getYAngle();
+        constants.zoom = getZoom();
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConstants), &constants);
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelinePoints);
@@ -711,20 +719,36 @@ int main(int argc, char** argv) {
     std::srand((unsigned int)std::time(nullptr));
     std::setlocale(LC_ALL, "russian");
 
+    if (argc > 1) {
+        N = std::atoi(argv[1]);
+    }
+    else {
+        std::cout << "Enter the number of particles N (for example 16000), but no less than 128: ";
+        std::cin >> N;
+    }
+    if (N < 128) N = 16000;
+
     generateWorld();
     cudaInitDevices();
 
     std::cout << "\n\nN: " << N << std::endl << std::endl;
     std::cout << "[1] -- Select CPU (OpenMP)\n";
-    std::cout << "[2] -- Select CUDA Force Calc\n";
-    std::cout << "[3] -- Select CUDA Tile Calc\n";
-    std::cout << "[Click + drag] -- Rotate" << std::endl << std::endl;
+    if (hasCuda) {
+        std::cout << "[2] -- Select CUDA Force Calc\n";
+        std::cout << "[3] -- Select CUDA Tile Calc\n";
+    }
+    else {
+        std::cout << "[2] -- CUDA Force Calc (UNAVAILABLE)\n";
+        std::cout << "[3] -- CUDA Tile Calc (UNAVAILABLE)\n";
+    }
+    std::cout << "[Click + drag] -- Rotate | [Scroll] -- Zoom" << std::endl << std::endl;
 
     glfwInit();
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-    window = glfwCreateWindow(w, h, "Nbody V3.2.1", nullptr, nullptr);
+    window = glfwCreateWindow(w, h, "Nbody V4.1", nullptr, nullptr);
     glfwSetCursorPosCallback(window, MousePressedMove);
+    glfwSetScrollCallback(window, MouseScroll);
     glfwSetKeyCallback(window, keyboardPressed);
 
     try {
