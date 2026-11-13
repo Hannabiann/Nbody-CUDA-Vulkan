@@ -14,6 +14,7 @@
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <vector>
+#include <string>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <cmath>
 #include <clocale>
+#include <algorithm>
 
 #ifdef _WIN32
 PFN_vkGetMemoryWin32HandleKHR fpGetMemoryWin32HandleKHR = nullptr;
@@ -37,18 +39,17 @@ void initVulkanExtensions(VkInstance instance) {
 extern void drawFrame();
 extern void CallNextFrame(float deltaTime);
 extern void MousePressedMove(GLFWwindow* window, double xpos, double ypos);
+extern void MouseScroll(GLFWwindow* window, double xoffset, double yoffset);
 extern void keyboardPressed(GLFWwindow* window, int key, int scancode, int action, int mods);
 extern void createVertexBuffer();
+extern void cleanupVertexBuffer();
+extern "C" void GPU_Free();
 extern float getXAngle();
 extern float getYAngle();
 extern float getZoom();
-extern void MouseScroll(GLFWwindow* window, double xoffset, double yoffset);
 
 extern void cudaInitDevices();
 extern void generateWorld();
-extern void cleanupVertexBuffer();
-extern "C" void GPU_Free();
-extern "C" void GPU_Sync();
 
 const int h = 1000;
 const int w = 1000;
@@ -81,13 +82,37 @@ std::vector<VkFence> inFlightFences;
 uint32_t currentFrame = 0;
 GLFWwindow* window;
 
+bool framebufferResized = false;
+bool isFullscreen = false;
+int savedWinX = 100, savedWinY = 100, savedWinW = w, savedWinH = h;
+
 size_t g_vertexCount = 0;
 
 struct PushConstants {
     float x_angle;
     float y_angle;
     float zoom;
+    float aspect;
 };
+
+void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
+    framebufferResized = true;
+}
+
+void toggleFullscreen() {
+    isFullscreen = !isFullscreen;
+    if (isFullscreen) {
+        glfwGetWindowPos(window, &savedWinX, &savedWinY);
+        glfwGetWindowSize(window, &savedWinW, &savedWinH);
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+    }
+    else {
+        glfwSetWindowMonitor(window, nullptr, savedWinX, savedWinY, savedWinW, savedWinH, 0);
+    }
+    framebufferResized = true;
+}
 
 VkShaderModule createShaderModule(const uint32_t* code, size_t sizeInBytes) {
     VkShaderModuleCreateInfo createInfo{};
@@ -105,8 +130,8 @@ VkShaderModule createShaderModule(const uint32_t* code, size_t sizeInBytes) {
 void createInstance() {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "Nbody";
-    appInfo.applicationVersion = VK_MAKE_VERSION(4, 1, 0);
+    appInfo.pApplicationName = APP_TITLE;
+    appInfo.applicationVersion = VK_MAKE_VERSION(APP_VER_MAJOR, APP_VER_MINOR, APP_VER_PATCH);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -167,7 +192,7 @@ void pickPhysicalDevice() {
 
     VkPhysicalDeviceProperties deviceProperties;
     vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
-    std::cout << "Using GPU: " << deviceProperties.deviceName << std::endl;
+    std::cout << "Using Vulkan GPU: " << deviceProperties.deviceName << std::endl;
 }
 
 void createLogicalDevice() {
@@ -200,6 +225,8 @@ void createLogicalDevice() {
     queueCreateInfo.pQueuePriorities = &queuePriority;
 
     VkPhysicalDeviceFeatures deviceFeatures{};
+    // Разрешаем gl_PointSize > 1.0 в вершинном шейдере для круглых звезд с ореолом
+    deviceFeatures.largePoints = VK_TRUE;
 
     std::vector<const char*> extensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     if (hasCuda) {
@@ -262,8 +289,10 @@ void createSwapChain() {
 
     VkExtent2D extent = capabilities.currentExtent;
     if (capabilities.currentExtent.width == UINT32_MAX) {
-        extent.width = w;
-        extent.height = h;
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        extent.width = std::clamp(static_cast<uint32_t>(width), capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+        extent.height = std::clamp(static_cast<uint32_t>(height), capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
     }
 
     uint32_t imageCount = capabilities.minImageCount + 1;
@@ -432,10 +461,17 @@ void createGraphicsPipeline() {
     multisampling.sampleShadingEnable = VK_FALSE;
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+    // Аддитивное смешивание цветов (Additive Blending)
     VkPipelineColorBlendAttachmentState colorBlendAttachment{};
     colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    colorBlendAttachment.blendEnable = VK_TRUE;
+    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 
     VkPipelineColorBlendStateCreateInfo colorBlending{};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -508,6 +544,33 @@ void createFramebuffers() {
     }
 }
 
+void cleanupSwapChain() {
+    for (auto framebuffer : swapChainFramebuffers) {
+        vkDestroyFramebuffer(device, framebuffer, nullptr);
+    }
+    for (auto imageView : swapChainImageViews) {
+        vkDestroyImageView(device, imageView, nullptr);
+    }
+    vkDestroySwapchainKHR(device, swapChain, nullptr);
+}
+
+void recreateSwapChain() {
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(window, &width, &height);
+    while (width == 0 || height == 0) {
+        glfwGetFramebufferSize(window, &width, &height);
+        glfwWaitEvents();
+    }
+
+    vkDeviceWaitIdle(device);
+
+    cleanupSwapChain();
+
+    createSwapChain();
+    createImageViews();
+    createFramebuffers();
+}
+
 void createCommandPool() {
     uint32_t queueFamilyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
@@ -533,7 +596,7 @@ void createCommandPool() {
 }
 
 void createCommandBuffers() {
-    commandBuffers.resize(swapChainFramebuffers.size());
+    commandBuffers.resize(3);
 
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -611,14 +674,19 @@ void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
         constants.x_angle = getXAngle();
         constants.y_angle = getYAngle();
         constants.zoom = getZoom();
+        constants.aspect = (swapChainExtent.height > 0)
+            ? ((float)swapChainExtent.width / (float)swapChainExtent.height)
+            : 1.0f;
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConstants), &constants);
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelinePoints);
         vkCmdDraw(commandBuffer, N, 1, 0, 0);
 
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLines);
-        uint32_t axisVertexCount = static_cast<uint32_t>(g_vertexCount - N);
-        vkCmdDraw(commandBuffer, axisVertexCount, 1, N, 0);
+        if (showAxes && g_vertexCount > (size_t)N) {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLines);
+            uint32_t axisVertexCount = static_cast<uint32_t>(g_vertexCount - N);
+            vkCmdDraw(commandBuffer, axisVertexCount, 1, N, 0);
+        }
     }
 
     vkCmdEndRenderPass(commandBuffer);
@@ -634,6 +702,7 @@ void renderVulkanFrame() {
         VK_NULL_HANDLE, &imageIndex);
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapChain();
         return;
     }
     else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
@@ -674,7 +743,12 @@ void renderVulkanFrame() {
     presentInfo.pImageIndices = &imageIndex;
     presentInfo.pResults = nullptr;
 
-    vkQueuePresentKHR(graphicsQueue, &presentInfo);
+    result = vkQueuePresentKHR(graphicsQueue, &presentInfo);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
+        framebufferResized = false;
+        recreateSwapChain();
+    }
 
     currentFrame = (currentFrame + 1) % 3;
 }
@@ -693,20 +767,13 @@ static void cleanupVulkan() {
 
     vkDestroyCommandPool(device, commandPool, nullptr);
 
-    for (auto framebuffer : swapChainFramebuffers) {
-        vkDestroyFramebuffer(device, framebuffer, nullptr);
-    }
+    cleanupSwapChain();
 
     vkDestroyPipeline(device, pipelinePoints, nullptr);
     vkDestroyPipeline(device, pipelineLines, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     vkDestroyRenderPass(device, renderPass, nullptr);
 
-    for (auto imageView : swapChainImageViews) {
-        vkDestroyImageView(device, imageView, nullptr);
-    }
-
-    vkDestroySwapchainKHR(device, swapChain, nullptr);
     vkDestroyDevice(device, nullptr);
     vkDestroySurfaceKHR(instance, surface, nullptr);
     vkDestroyInstance(instance, nullptr);
@@ -720,33 +787,44 @@ int main(int argc, char** argv) {
     std::setlocale(LC_ALL, "russian");
 
     if (argc > 1) {
-        N = std::atoi(argv[1]);
+        int val = std::atoi(argv[1]);
+        if (val >= 128) N = val;
     }
     else {
-        std::cout << "Enter the number of particles N (for example 16000), but no less than 128: ";
-        std::cin >> N;
+        std::cout << "Enter the number of particles N [N>127, default 16000; press Enter to skip]: ";
+        std::string input;
+        std::getline(std::cin, input);
+        if (!input.empty()) {
+            int val = std::atoi(input.c_str());
+            if (val >= 128) N = val;
+        }
     }
-    if (N < 128) N = 16000;
 
     generateWorld();
     cudaInitDevices();
 
     std::cout << "\n\nN: " << N << std::endl << std::endl;
-    std::cout << "[1] -- Select CPU (OpenMP)\n";
+    std::cout << "[1]           -- Select CPU (OpenMP)\n";
     if (hasCuda) {
-        std::cout << "[2] -- Select CUDA Force Calc\n";
-        std::cout << "[3] -- Select CUDA Tile Calc\n";
+        std::cout << "[2]           -- Select CUDA Force Calc\n";
+        std::cout << "[3]           -- Select CUDA Tile Calc\n";
     }
     else {
-        std::cout << "[2] -- CUDA Force Calc (UNAVAILABLE)\n";
-        std::cout << "[3] -- CUDA Tile Calc (UNAVAILABLE)\n";
+        std::cout << "[2]           -- CUDA Force Calc (UNAVAILABLE)\n";
+        std::cout << "[3]           -- CUDA Tile Calc (UNAVAILABLE)\n";
     }
-    std::cout << "[Click + drag] -- Rotate | [Scroll] -- Zoom" << std::endl << std::endl;
+    std::cout << "[Space]       -- Pause / Resume\n";
+    std::cout << "[R]           -- Restart Simulation\n";
+    std::cout << "[+] / [-]     -- Speed Up / Slow Down (dt)\n";
+    std::cout << "[G]           -- Show / Hide XYZ Axes\n";
+    std::cout << "[F11] / [F]   -- Fullscreen Toggle\n";
+    std::cout << "[Drag/Scroll] -- Rotate / Zoom" << std::endl << std::endl;
 
     glfwInit();
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-    window = glfwCreateWindow(w, h, "Nbody V4.1", nullptr, nullptr);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    window = glfwCreateWindow(w, h, APP_TITLE, nullptr, nullptr);
+    glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
     glfwSetCursorPosCallback(window, MousePressedMove);
     glfwSetScrollCallback(window, MouseScroll);
     glfwSetKeyCallback(window, keyboardPressed);
@@ -773,15 +851,11 @@ int main(int argc, char** argv) {
     createVertexBuffer();
 
     auto lastTime = std::chrono::high_resolution_clock::now();
-  
 
     while (!glfwWindowShouldClose(window)) {
         auto currentTime = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
         lastTime = currentTime;
-
-        glfwPollEvents();
-        CallNextFrame(deltaTime);
 
         glfwPollEvents();
         CallNextFrame(deltaTime);

@@ -7,34 +7,29 @@
 #include "global.h"
 #include <cstdio>
 #include <cmath>
+#include <vector>
 
 struct Vec3 {
     float x, y, z;
 };
 
-// Девайсные указатели для хранения физических параметров на GPU
-float* dev_POSX = nullptr;
-float* dev_POSY = nullptr;
-float* dev_POSZ = nullptr;
-float* dev_POSM = nullptr;
+// Векторизованный буфер: .x = X, .y = Y, .z = Z, .w = Mass (читается за 1 инструкцию LDG.E.128)
+float4* dev_POS = nullptr;
 float* dev_POSR = nullptr;
 
 // Ресурсы CUDA-Vulkan Interop
 cudaExternalMemory_t extVulkanMem = nullptr;
 Vec3* dev_vkVertices = nullptr;
 
-const int BLOCK_SIZE = 256;
+const int BLOCK_SIZE = 128;
 
 // ============================================================================
-// CUDA ЯДРО 1: Force (Прямой кэшированный доступ)
+// CUDA ЯДРО 1: Force (128-битное векторное чтение float4)
 // ============================================================================
 __global__ void NbodyForceKernelOptimized(
-    const float* __restrict__ posx,
-    const float* __restrict__ posy,
-    const float* __restrict__ posz,
-    const float* __restrict__ posm,
+    const float4* __restrict__ pos,
     float* __restrict__ posr,
-    int N, int grav, float EPS)
+    int N, int grav, float EPS, float dt)
 {
     unsigned int first = blockIdx.x * blockDim.x + threadIdx.x;
     if (first >= N) return;
@@ -43,23 +38,23 @@ __global__ void NbodyForceKernelOptimized(
     float AY_M = 0.0f;
     float AZ_M = 0.0f;
 
-    float fx = posx[first];
-    float fy = posy[first];
-    float fz = posz[first];
-
+    float4 myPos = pos[first];
     const float eps2 = EPS * EPS;
+    const float grav_dt = grav * dt;
 
 #pragma unroll 16
     for (unsigned int next = 0; next < N; next++) {
-        float det_X = posx[next] - fx;
-        float det_Y = posy[next] - fy;
-        float det_Z = posz[next] - fz;
+        float4 other = pos[next];
+
+        float det_X = other.x - myPos.x;
+        float det_Y = other.y - myPos.y;
+        float det_Z = other.z - myPos.z;
 
         float norm = det_X * det_X + det_Y * det_Y + det_Z * det_Z;
         float ext = norm + eps2;
 
         float inv_dist = rsqrtf(ext);
-        float den = (grav * posm[next]) * (inv_dist * inv_dist * inv_dist);
+        float den = (grav_dt * other.w) * (inv_dist * inv_dist * inv_dist);
 
         AX_M += det_X * den;
         AY_M += det_Y * den;
@@ -72,15 +67,12 @@ __global__ void NbodyForceKernelOptimized(
 }
 
 // ============================================================================
-// CUDA ЯДРО 2: Tile (Разделяемая память)
+// CUDA ЯДРО 2: Tile (Векторизованная Shared Memory float4)
 // ============================================================================
 __global__ void NbodyTileKernelOptimized(
-    const float* __restrict__ posx,
-    const float* __restrict__ posy,
-    const float* __restrict__ posz,
-    const float* __restrict__ posm,
+    const float4* __restrict__ pos,
     float* __restrict__ posr,
-    int N, int grav, float EPS)
+    int N, int grav, float EPS, float dt)
 {
     unsigned int first = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -88,54 +80,44 @@ __global__ void NbodyTileKernelOptimized(
     float AY_M = 0.0f;
     float AZ_M = 0.0f;
 
-    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    float4 myPos = { 0.0f, 0.0f, 0.0f, 0.0f };
     if (first < N) {
-        fx = posx[first];
-        fy = posy[first];
-        fz = posz[first];
+        myPos = pos[first];
     }
 
-    __shared__ float sh_x[BLOCK_SIZE];
-    __shared__ float sh_y[BLOCK_SIZE];
-    __shared__ float sh_z[BLOCK_SIZE];
-    __shared__ float sh_m[BLOCK_SIZE];
+    // Единый векторный массив в разделяемой памяти (читается через LDS.128 broadcast)
+    __shared__ float4 sh_pos[BLOCK_SIZE];
 
     unsigned int numTiles = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const float eps2 = EPS * EPS;
+    const float grav_dt = grav * dt;
 
     for (unsigned int tile = 0; tile < numTiles; tile++) {
         unsigned int idx = tile * BLOCK_SIZE + threadIdx.x;
 
         if (idx < N) {
-            sh_x[threadIdx.x] = posx[idx];
-            sh_y[threadIdx.x] = posy[idx];
-            sh_z[threadIdx.x] = posz[idx];
-            sh_m[threadIdx.x] = posm[idx];
+            sh_pos[threadIdx.x] = pos[idx];
         }
         else {
-            sh_x[threadIdx.x] = 0.0f;
-            sh_y[threadIdx.x] = 0.0f;
-            sh_z[threadIdx.x] = 0.0f;
-            sh_m[threadIdx.x] = 0.0f;
+            sh_pos[threadIdx.x] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
 
         __syncthreads();
 
         if (first < N) {
-            const float eps2 = EPS * EPS;
-
-        #pragma unroll 16
+#pragma unroll 16
             for (unsigned int j = 0; j < BLOCK_SIZE; j++) {
-                if (tile * BLOCK_SIZE + j >= N) break;
+                float4 other = sh_pos[j];
 
-                float det_X = sh_x[j] - fx;
-                float det_Y = sh_y[j] - fy;
-                float det_Z = sh_z[j] - fz;
+                float det_X = other.x - myPos.x;
+                float det_Y = other.y - myPos.y;
+                float det_Z = other.z - myPos.z;
 
                 float norm = det_X * det_X + det_Y * det_Y + det_Z * det_Z;
                 float ext = norm + eps2;
 
                 float inv_dist = rsqrtf(ext);
-                float den = (grav * sh_m[j]) * (inv_dist * inv_dist * inv_dist);
+                float den = (grav_dt * other.w) * (inv_dist * inv_dist * inv_dist);
 
                 AX_M += det_X * den;
                 AY_M += det_Y * den;
@@ -154,34 +136,30 @@ __global__ void NbodyTileKernelOptimized(
 }
 
 // ============================================================================
-// CUDA ЯДРО 3: Интеграция позиций + Прямая запись в буфер Vulkan (Zero-Copy)
+// CUDA ЯДРО 3: Интеграция позиций с шагом dt + Zero-Copy запись в буфер Vulkan
 // ============================================================================
 __global__ void IntegratePositionsKernel(
-    float* __restrict__ posx,
-    float* __restrict__ posy,
-    float* __restrict__ posz,
+    float4* __restrict__ pos,
     const float* __restrict__ posr,
     Vec3* __restrict__ vk_verts,
-    int N)
+    int N, float dt)
 {
     unsigned int first = blockIdx.x * blockDim.x + threadIdx.x;
     if (first >= N) return;
 
-    float nx = posx[first] + posr[first];
-    float ny = posy[first] + posr[first + N];
-    float nz = posz[first] + posr[first + 2 * N];
-
-    posx[first] = nx;
-    posy[first] = ny;
-    posz[first] = nz;
+    float4 p = pos[first];
+    p.x += posr[first] * dt;
+    p.y += posr[first + N] * dt;
+    p.z += posr[first + 2 * N] * dt;
+    pos[first] = p;
 
     if (vk_verts != nullptr) {
-        vk_verts[first] = { nx, ny, nz };
+        vk_verts[first] = { p.x, p.y, p.z };
     }
 }
 
 // ============================================================================
-// ВНЕШНИЙ ИНТЕРФЕЙС УПРАВЛЕНИЯ ПАМЯТЬЮ И КРОССПЛАТФОРМЕННЫЙ INTEROP
+// ВНЕШНИЙ ИНТЕРФЕЙС УПРАВЛЕНИЯ ПАМЯТЬЮ И INTEROP
 // ============================================================================
 
 extern "C" void GPU_UnregisterVulkanBuffer()
@@ -250,64 +228,57 @@ extern "C" void GPU_UpdateVulkanBufferFromHost(const void* hostData, size_t data
 
 extern "C" void GPU_Malloc()
 {
-    if (dev_POSX != nullptr) return;
-    cudaMalloc(&dev_POSX, N * sizeof(float));
-    cudaMalloc(&dev_POSY, N * sizeof(float));
-    cudaMalloc(&dev_POSZ, N * sizeof(float));
-    cudaMalloc(&dev_POSM, N * sizeof(float));
+    if (dev_POS != nullptr) return;
+    cudaMalloc(&dev_POS, N * sizeof(float4));
     cudaMalloc(&dev_POSR, N * 3 * sizeof(float));
 }
 
 extern "C" void GPU_Free()
 {
-    if (dev_POSX == nullptr) return;
-    cudaFree(dev_POSX); dev_POSX = nullptr;
-    cudaFree(dev_POSY); dev_POSY = nullptr;
-    cudaFree(dev_POSZ); dev_POSZ = nullptr;
-    cudaFree(dev_POSM); dev_POSM = nullptr;
+    if (dev_POS == nullptr) return;
+    cudaFree(dev_POS);  dev_POS = nullptr;
     cudaFree(dev_POSR); dev_POSR = nullptr;
 }
 
 extern "C" void GPU_UploadDataToDevice()
 {
-    if (dev_POSX == nullptr) return;
-    cudaMemcpy(dev_POSX, POSX, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_POSY, POSY, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_POSZ, POSZ, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_POSM, POSM, N * sizeof(float), cudaMemcpyHostToDevice);
+    if (dev_POS == nullptr) return;
+    std::vector<float4> hostPos(N);
+    for (int i = 0; i < N; i++) {
+        hostPos[i] = make_float4(POSX[i], POSY[i], POSZ[i], POSM[i]);
+    }
+    cudaMemcpy(dev_POS, hostPos.data(), N * sizeof(float4), cudaMemcpyHostToDevice);
     cudaMemcpy(dev_POSR, POSR, N * 3 * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 extern "C" void GPU_DownloadDataFromDevice()
 {
-    if (dev_POSX == nullptr) return;
-    cudaMemcpy(POSX, dev_POSX, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(POSY, dev_POSY, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(POSZ, dev_POSZ, N * sizeof(float), cudaMemcpyDeviceToHost);
+    if (dev_POS == nullptr) return;
+    std::vector<float4> hostPos(N);
+    cudaMemcpy(hostPos.data(), dev_POS, N * sizeof(float4), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < N; i++) {
+        POSX[i] = hostPos[i].x;
+        POSY[i] = hostPos[i].y;
+        POSZ[i] = hostPos[i].z;
+    }
     cudaMemcpy(POSR, dev_POSR, N * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
-extern "C" void GPU_Math(int current_grav, float current_eps)
+extern "C" void GPU_Math(int current_grav, float current_eps, float dt)
 {
-    if (dev_POSX == nullptr) return;
+    if (dev_POS == nullptr) return;
 
     dim3 dimBlock(BLOCK_SIZE);
     dim3 dimGrid((N + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     if (button == 2) {
-        NbodyForceKernelOptimized << <dimGrid, dimBlock >> > (dev_POSX, dev_POSY, dev_POSZ, dev_POSM, dev_POSR, N, current_grav, current_eps);
+        NbodyForceKernelOptimized << <dimGrid, dimBlock >> > (dev_POS, dev_POSR, N, current_grav, current_eps, dt);
     }
     else if (button == 3) {
-        NbodyTileKernelOptimized << <dimGrid, dimBlock >> > (dev_POSX, dev_POSY, dev_POSZ, dev_POSM, dev_POSR, N, current_grav, current_eps);
+        NbodyTileKernelOptimized << <dimGrid, dimBlock >> > (dev_POS, dev_POSR, N, current_grav, current_eps, dt);
     }
 
-    IntegratePositionsKernel << <dimGrid, dimBlock >> > (dev_POSX, dev_POSY, dev_POSZ, dev_POSR, dev_vkVertices, N);
-    // Убрали cudaDeviceSynchronize() отсюда — ядра запускаются асинхронно за ~5 мкс!
-}
+    IntegratePositionsKernel << <dimGrid, dimBlock >> > (dev_POS, dev_POSR, dev_vkVertices, N, dt);
 
-extern "C" void GPU_Sync()
-{
-    if (button != 1 && dev_POSX != nullptr) {
-        cudaDeviceSynchronize();
-    }
+    cudaDeviceSynchronize();
 }

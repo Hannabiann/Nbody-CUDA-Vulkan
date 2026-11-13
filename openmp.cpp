@@ -2,19 +2,19 @@
 #include <omp.h>
 #include <cmath>
 
-// CPU_OpenMP
 void OMP_Math()
 {
     const float eps2 = EPS * EPS;
+    const float dt = simSpeed;
+    const float grav_dt = grav * dt;
 
-    // Шаг 1: Расчет сил и обновление скоростей
+    // Шаг 1: Расчет сил и обновление скоростей с учетом шага времени dt
 #pragma omp parallel for schedule(static)
     for (int first = 0; first < N; first++) {
         float AX_M = 0.0f;
         float AY_M = 0.0f;
         float AZ_M = 0.0f;
 
-        // Кэшируем координаты текущей частицы в регистры (как в cuda.cu)
         const float fx = POSX[first];
         const float fy = POSY[first];
         const float fz = POSZ[first];
@@ -28,7 +28,7 @@ void OMP_Math()
             float ext = norm + eps2;
 
             float inv_dist = 1.0f / std::sqrt(ext);
-            float den = (grav * POSM[next]) * (inv_dist * inv_dist * inv_dist);
+            float den = (grav_dt * POSM[next]) * (inv_dist * inv_dist * inv_dist);
 
             AX_M += det_X * den;
             AY_M += det_Y * den;
@@ -40,11 +40,11 @@ void OMP_Math()
         POSR[first + 2 * N] += AZ_M;
     }
 
-    // Шаг 2: Интеграция позиций
+    // Шаг 2: Интеграция позиций с учетом dt
 #pragma omp parallel for schedule(static)
     for (int first = 0; first < N; first++) {
-        POSX[first] += POSR[first];
-        POSY[first] += POSR[first + N];
-        POSZ[first] += POSR[first + 2 * N];
+        POSX[first] += POSR[first] * dt;
+        POSY[first] += POSR[first + N] * dt;
+        POSZ[first] += POSR[first + 2 * N] * dt;
     }
 }

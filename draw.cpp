@@ -21,6 +21,8 @@ extern VkDevice device;
 extern VkPhysicalDevice physicalDevice;
 extern GLFWwindow* window;
 extern size_t g_vertexCount;
+extern void resetSimulation();
+extern void toggleFullscreen();
 
 #ifdef _WIN32
 extern PFN_vkGetMemoryWin32HandleKHR fpGetMemoryWin32HandleKHR;
@@ -38,7 +40,7 @@ extern "C" {
 VkBuffer vertexBuffer = VK_NULL_HANDLE;
 VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
 VkDeviceSize vertexBufferAllocSize = 0;
-void* pMappedPosData = nullptr; // Используется, когда CUDA недоступна
+void* pMappedPosData = nullptr;
 
 VkBuffer colorBuffer = VK_NULL_HANDLE;
 VkDeviceMemory colorBufferMemory = VK_NULL_HANDLE;
@@ -119,31 +121,74 @@ void MouseScroll(GLFWwindow* window, double xoffset, double yoffset) {
     if (view_zoom < 500.0f) view_zoom = 500.0f;
 }
 
+void updateWindowTitle() {
+    const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
+    const char* state_str = isPaused ? " [PAUSED]" : "";
+    char res[140];
+    std::snprintf(res, sizeof(res), APP_TITLE " | Method: %s | Speed: %.2fx | FPS: %.3f%s",
+        name_method, simSpeed, fps, state_str);
+    glfwSetWindowTitle(window, res);
+}
+
 void keyboardPressed(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+        if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {
+            // До 1.0x идем с шагом 0.10, выше 1.0x — с шагом 0.25
+            float step = (simSpeed < 1.0f) ? 0.10f : 0.25f;
+            simSpeed = std::round((simSpeed + step) * 100.0f) / 100.0f;
+            if (simSpeed > 10.0f) simSpeed = 10.0f;
+            updateWindowTitle();
+        }
+        else if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) {
+            // Выше 1.0x идем с шагом 0.25, от 1.0x и ниже — с шагом 0.10
+            float step = (simSpeed > 1.0f) ? 0.25f : 0.10f;
+            simSpeed = std::round((simSpeed - step) * 100.0f) / 100.0f;
+            if (simSpeed < 0.10f) simSpeed = 0.10f;
+            updateWindowTitle();
+        }
+    }
+
     if (action == GLFW_PRESS) {
+        int newButton = button;
         switch (key) {
         case GLFW_KEY_1:
-            button = 1;
-            dataChanged = true;
+            newButton = 1;
             break;
         case GLFW_KEY_2:
-            if (hasCuda) {
-                button = 2;
-                dataChanged = true;
-            }
-            else {
-                std::cout << "[CUDA Unavailable] Running in CPU (OpenMP) mode.\n";
-            }
+            if (hasCuda) newButton = 2;
+            else std::cout << "[CUDA Unavailable] Running in CPU (OpenMP) mode.\n";
             break;
         case GLFW_KEY_3:
-            if (hasCuda) {
-                button = 3;
-                dataChanged = true;
-            }
-            else {
-                std::cout << "[CUDA Unavailable] Running in CPU (OpenMP) mode.\n";
-            }
+            if (hasCuda) newButton = 3;
+            else std::cout << "[CUDA Unavailable] Running in CPU (OpenMP) mode.\n";
             break;
+        case GLFW_KEY_0:
+        case GLFW_KEY_KP_0:
+            simSpeed = 1.0f; // Мгновенный сброс скорости в 1.00x
+            updateWindowTitle();
+            break;
+        case GLFW_KEY_SPACE:
+            isPaused = !isPaused;
+            updateWindowTitle();
+            break;
+        case GLFW_KEY_R:
+            vkDeviceWaitIdle(device);
+            resetSimulation();
+            break;
+        case GLFW_KEY_G:
+            showAxes = !showAxes;
+            break;
+        case GLFW_KEY_F11:
+        case GLFW_KEY_F:
+            toggleFullscreen();
+            break;
+        }
+
+        if (newButton != button) {
+            vkDeviceWaitIdle(device);
+            button = newButton;
+            dataChanged = true;
+            updateWindowTitle();
         }
     }
 }
@@ -201,8 +246,8 @@ void createVertexBuffer() {
     cpuPositions.reserve(N + 200); cpuColors.reserve(N + 200);
 
     int N_large = (N * 3) / 4;
-    int bulgeLarge = N_large / 7;
-    int bulgeSmall = (N - N_large) / 7;
+    int bulgeLarge = N_large / 5;
+    int bulgeSmall = (N - N_large) / 5;
 
     for (int i = 0; i < N; i++) {
         cpuPositions.push_back({ POSX[i], POSY[i], POSZ[i] });
@@ -259,7 +304,6 @@ void createVertexBuffer() {
     VkDeviceSize colorSize = sizeof(Vec3) * g_vertexCount;
 
     if (hasCuda) {
-        // Режим с поддержкой CUDA: буфер в DEVICE_LOCAL памяти и экспорт в CUDA
         vertexBufferAllocSize = helperCreateBuffer(
             posSize,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -283,7 +327,6 @@ void createVertexBuffer() {
 #endif
     }
     else {
-        // Режим без CUDA: обычный HOST_VISIBLE буфер для прямого доступа с CPU
         vertexBufferAllocSize = helperCreateBuffer(
             posSize,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -315,12 +358,10 @@ void createVertexBuffer() {
 
 void updateVertexBuffer() {
     if (!bufferCreated) { createVertexBuffer(); return; }
-
-    // Если работает CUDA (кнопки 2 или 3), вершины обновляются напрямую в VRAM
+    if (isPaused) return;
     if (hasCuda && button != 1) return;
 
     if (hasCuda) {
-        // CPU OpenMP на компьютере с CUDA
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; i++) {
             cpuPositions[i].x = POSX[i];
@@ -330,7 +371,6 @@ void updateVertexBuffer() {
         GPU_UpdateVulkanBufferFromHost(cpuPositions.data(), N * sizeof(Vec3));
     }
     else if (pMappedPosData != nullptr) {
-        // CPU OpenMP на компьютере без CUDA (прямая запись в память Vulkan)
         Vec3* posData = static_cast<Vec3*>(pMappedPosData);
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; i++) {
@@ -353,8 +393,10 @@ void drawFrame() {
     if (time_f - timebase >= 1000.0f) {
         fps = frames * 1000.0f / (time_f - timebase); timebase = time_f; frames = 0;
         const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
-        char res[100];
-        std::snprintf(res, sizeof(res), "Nbody V4.1 | Method: %s | FPS: %.3f", name_method, fps);
+        const char* state_str = isPaused ? " [PAUSED]" : "";
+        char res[140];
+        std::snprintf(res, sizeof(res), APP_TITLE " | Method: %s | Speed: %.2fx | FPS: %.3f%s",
+            name_method, simSpeed, fps, state_str);
         glfwSetWindowTitle(window, res);
     }
     updateVertexBuffer();
