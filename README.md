@@ -4,7 +4,7 @@ This is an evolution of the [Nbody-CUDA-GLUT project](https://github.com/Hannabi
 
 <img width="2258" height="1029" alt="Nbody-CUDA-Vulkan" src="https://github.com/user-attachments/assets/e04ebdbf-4296-414f-b7fe-5ad65e693fa6" />
 
-## Bench
+## Bench (use fast-math)
 __Windows__
 
 | Device/Mode | N=16000 (FPS) | N=64000 (FPS) |
