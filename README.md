@@ -4,24 +4,24 @@ This is an evolution of the [Nbody-CUDA-GLUT project](https://github.com/Hannabi
 
 <img width="2258" height="1029" alt="Nbody-CUDA-Vulkan" src="https://github.com/user-attachments/assets/e04ebdbf-4296-414f-b7fe-5ad65e693fa6" />
 
-## Bench (use fast-math, v4.1)
+## Bench (use fast-math, v4.2)
 __Windows__
 
 | Device/Mode | N=16000 (FPS) | N=64000 (FPS) |
 | :--- | :---: | :---: |
-| Ryzen 9800x3d (AVX-512) | ~ 210 | ~ 13 |
-| Ryzen 9800x3d (AVX-2) | ~ 109 | ~ 7 |
-| Ryzen 7600 (AVX-512) | ~ 93 | ~ 6 |
-| Ryzen 7600 (AVX-2) | ~ 73 | ~ 5 |
-| RTX 4060 (Force) | ~ 680 | ~ 81 |
-| RTX 4060 (Tile) | ~ 1084 | ~ 81 |
-| RTX 4090 (Force) | ~ 1300 | ~ 265 |
-| RTX 4090 (Tile) | ~ 2390 | ~ 408 |
+| Ryzen 9800x3d (AVX-512) | ~ 252 | ~ 16 |
+| Ryzen 9800x3d (AVX-2) | ~ 132 | ~ 8.5 |
+| Ryzen 7600 (AVX-512) | ~ 106 | ~ 7.1 |
+| Ryzen 7600 (AVX-2) | ~ 85 | ~ 5.8 |
+| RTX 4060 (Force) | ~ 935 | ~ 74 |
+| RTX 4060 (Tile) | ~ 1020 | ~ 84 |
+| RTX 4090 (Force) | ~ 1180 | ~ 300 |
+| RTX 4090 (Tile) | ~ 2250 | ~ 370 |
 
 __Linux (CachyOS)__
 | Device/Mode | N=16000 (FPS) | N=64000 (FPS) |
 | :--- | :---: | :---: |
-| Ryzen 7700 (AVX-512) | ~ 130 | ~ 8 |
-| Ryzen 7700 (AVX-2) | ~ 109 | ~ 7 |
-| RTX 4070 (Force) | ~ 1075 | ~ 93 |
-| RTX 4070 (Tile) | ~ 1720 | ~ 157 |
+| Ryzen 7700 (AVX-512) | ~ 131 | ~ 8.2 |
+| Ryzen 7700 (AVX-2) | ~ 109 | ~ 6 |
+| RTX 4070 (Force) | ~ 1194 | ~ 120 |
+| RTX 4070 (Tile) | ~ 1620 | ~ 147 |
