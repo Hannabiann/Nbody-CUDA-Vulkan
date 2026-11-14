@@ -1,4 +1,5 @@
 #ifdef _WIN32
+#define NOMINMAX
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #endif
@@ -47,6 +48,10 @@ extern "C" void GPU_Free();
 extern float getXAngle();
 extern float getYAngle();
 extern float getZoom();
+extern float getWarp();
+extern float getGamma();
+extern float getRotVelX();
+extern float getRotVelY();
 
 extern void cudaInitDevices();
 extern void generateWorld();
@@ -68,6 +73,7 @@ VkRenderPass renderPass;
 
 VkPipeline pipelinePoints = VK_NULL_HANDLE;
 VkPipeline pipelineLines = VK_NULL_HANDLE;
+VkPipeline pipelineCMB = VK_NULL_HANDLE;
 
 VkPipelineLayout pipelineLayout;
 VkCommandPool commandPool;
@@ -93,7 +99,15 @@ struct PushConstants {
     float y_angle;
     float zoom;
     float aspect;
+    float warp;
+    float gamma;
+    float rotVelX;
+    float rotVelY;
+    int renderMode;
 };
+
+#include "vert_spv.h"
+#include "frag_spv.h"
 
 void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
     framebufferResized = true;
@@ -428,7 +442,7 @@ void createGraphicsPipeline() {
     vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions;
 
     VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstantRange.offset = 0;
     pushConstantRange.size = sizeof(PushConstants);
 
@@ -518,6 +532,16 @@ void createGraphicsPipeline() {
 
     if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipelineLines) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create lines pipeline!");
+    }
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssemblyCMB{};
+    inputAssemblyCMB.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssemblyCMB.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssemblyCMB.primitiveRestartEnable = VK_FALSE;
+    pipelineInfo.pInputAssemblyState = &inputAssemblyCMB;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipelineCMB) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create CMB pipeline!");
     }
 
     vkDestroyShaderModule(device, fragShaderModule, nullptr);
@@ -677,12 +701,31 @@ void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
         constants.aspect = (swapChainExtent.height > 0)
             ? ((float)swapChainExtent.width / (float)swapChainExtent.height)
             : 1.0f;
-        vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConstants), &constants);
+        constants.warp = getWarp();
+        constants.gamma = getGamma();
+        constants.rotVelX = getRotVelX();
+        constants.rotVelY = getRotVelY();
 
+        const VkShaderStageFlags pushStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        // 1. Фон реликтового излучения (CMB) при субсветовой скорости
+        if (constants.gamma > 1.15f) {
+            constants.renderMode = 2;
+            vkCmdPushConstants(commandBuffer, pipelineLayout, pushStages, 0, sizeof(PushConstants), &constants);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineCMB);
+            vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        }
+
+        // 2. Звезды галактик
+        constants.renderMode = 0;
+        vkCmdPushConstants(commandBuffer, pipelineLayout, pushStages, 0, sizeof(PushConstants), &constants);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelinePoints);
         vkCmdDraw(commandBuffer, N, 1, 0, 0);
 
+        // 3. Координатные оси
         if (showAxes && g_vertexCount > (size_t)N) {
+            constants.renderMode = 1;
+            vkCmdPushConstants(commandBuffer, pipelineLayout, pushStages, 0, sizeof(PushConstants), &constants);
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLines);
             uint32_t axisVertexCount = static_cast<uint32_t>(g_vertexCount - N);
             vkCmdDraw(commandBuffer, axisVertexCount, 1, N, 0);
@@ -771,6 +814,7 @@ static void cleanupVulkan() {
 
     vkDestroyPipeline(device, pipelinePoints, nullptr);
     vkDestroyPipeline(device, pipelineLines, nullptr);
+    vkDestroyPipeline(device, pipelineCMB, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     vkDestroyRenderPass(device, renderPass, nullptr);
 

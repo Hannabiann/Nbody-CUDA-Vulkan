@@ -3,8 +3,8 @@
 
 #define APP_VER_MAJOR 4
 #define APP_VER_MINOR 2
-#define APP_VER_PATCH 0
-#define APP_TITLE "NBody V4.2.0"
+#define APP_VER_PATCH 1
+#define APP_TITLE "NBody V4.2.1"
 
 extern int N;
 extern const int h, w, grav;

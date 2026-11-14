@@ -1,4 +1,5 @@
 #ifdef _WIN32
+#define NOMINMAX
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #endif
@@ -16,6 +17,7 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 
 extern VkDevice device;
 extern VkPhysicalDevice physicalDevice;
@@ -23,6 +25,7 @@ extern GLFWwindow* window;
 extern size_t g_vertexCount;
 extern void resetSimulation();
 extern void toggleFullscreen();
+extern void getStarColor(int idx, float& r, float& g, float& b);
 
 #ifdef _WIN32
 extern PFN_vkGetMemoryWin32HandleKHR fpGetMemoryWin32HandleKHR;
@@ -47,6 +50,15 @@ VkDeviceMemory colorBufferMemory = VK_NULL_HANDLE;
 
 static float x_angle = 0.0f, y_angle = 0.0f;
 static float view_zoom = 6000.0f;
+static float target_zoom = 6000.0f;
+
+// Плавные (интерполированные) и целевые значения релятивистской скорости
+static double warp_drive = 0.0, warp_target = 0.0;
+static double rot_vel_x = 0.0, rot_target_x = 0.0;
+static double rot_vel_y = 0.0, rot_target_y = 0.0;
+static double current_beta = 0.0;
+static double current_gamma = 1.0;
+
 static float fps = 0.0f, time_f = 0.0f, timebase = 0.0f;
 static int frames = 0;
 
@@ -62,6 +74,10 @@ void clearDataChangedFlag() { dataChanged = false; }
 float getXAngle() { return x_angle; }
 float getYAngle() { return y_angle; }
 float getZoom() { return view_zoom; }
+float getWarp() { return (float)warp_drive; }
+float getGamma() { return (float)current_gamma; }
+float getRotVelX() { return (float)rot_vel_x; }
+float getRotVelY() { return (float)rot_vel_y; }
 VkBuffer getColorBuffer() { return colorBuffer; }
 void* getCpuVerticesPointer() { return cpuPositions.empty() ? nullptr : cpuPositions.data(); }
 
@@ -97,50 +113,90 @@ int getVulkanBufferMemoryFd() {
 }
 #endif
 
+static void recalculateRelativity() {
+    double rotMag = std::sqrt(rot_vel_x * rot_vel_x + rot_vel_y * rot_vel_y);
+    double driveMag = std::clamp(std::max(std::fabs(warp_drive), rotMag), 0.0, 1.0);
+
+    if (driveMag < 0.005) {
+        current_beta = 0.0;
+        current_gamma = 1.0;
+        return;
+    }
+
+    // Нелинейное отображение [0..1] -> beta вплоть до 0.9999999 (99.99999% скорости света)
+    // При driveMag = 1.0: 1 - beta = 10^-7 => beta = 0.9999999, gamma = 2236.07
+    double logOneMinusBeta = -7.0 * std::pow(driveMag, 1.35);
+    double oneMinusBeta = std::pow(10.0, logOneMinusBeta);
+    current_beta = 1.0 - oneMinusBeta;
+    if (current_beta > 0.9999999) current_beta = 0.9999999;
+
+    current_gamma = 1.0 / std::sqrt(1.0 - current_beta * current_beta);
+}
+
+void updateWindowTitle() {
+    const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
+    const char* state_str = isPaused ? " [PAUSED]" : "";
+    char res[200];
+    if (current_beta > 0.05) {
+        double peakCmbTemp = 2.725 * std::sqrt((1.0 + current_beta) / (1.0 - current_beta));
+        const char* dirSign = (warp_drive < -0.01) ? "-" : "+";
+        std::snprintf(res, sizeof(res),
+            APP_TITLE " | %s | v = %s%.5f%% c (gamma: %.0fx, CMB: %.0fK) | FPS: %.1f%s",
+            name_method, dirSign, current_beta * 100.0, current_gamma, peakCmbTemp, fps, state_str);
+    }
+    else {
+        std::snprintf(res, sizeof(res), APP_TITLE " | Method: %s | Speed: %.2fx | FPS: %.3f%s",
+            name_method, simSpeed, fps, state_str);
+    }
+    glfwSetWindowTitle(window, res);
+}
+
 void MousePressedMove(GLFWwindow* window, double xpos, double ypos) {
     static double lastX = 0, lastY = 0;
     static bool firstMouse = true;
     if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
         if (firstMouse) { lastX = xpos; lastY = ypos; firstMouse = false; }
+        double dx = xpos - lastX;
+        double dy = ypos - lastY;
+
         float sensitivity = 0.2f;
-        x_angle += (float)((ypos - lastY) * sensitivity);
-        y_angle += (float)((xpos - lastX) * sensitivity);
+        x_angle += (float)(dy * sensitivity);
+        y_angle += (float)(dx * sensitivity);
         if (x_angle > 89.0f) x_angle = 89.0f;
         if (x_angle < -89.0f) x_angle = -89.0f;
+
+        // Накапливаем целевой импульс вращения (плавно догоняется в drawFrame)
+        rot_target_x = std::clamp(rot_target_x + dx * 0.010, -1.0, 1.0);
+        rot_target_y = std::clamp(rot_target_y - dy * 0.010, -1.0, 1.0);
+
         lastX = xpos; lastY = ypos;
     }
     else { firstMouse = true; }
 }
 
 void MouseScroll(GLFWwindow* window, double xoffset, double yoffset) {
-    if (yoffset < 0)
-        view_zoom *= 1.15f;
-    else if (yoffset > 0)
-        view_zoom /= 1.15f;
+    // Плавный шаг зума без верхнего ограничения на отдаление
+    float zoomFactor = std::pow(1.12f, (float)(-yoffset));
+    target_zoom *= zoomFactor;
+    if (target_zoom < 50.0f) target_zoom = 50.0f;
 
-    if (view_zoom < 500.0f) view_zoom = 500.0f;
-}
-
-void updateWindowTitle() {
-    const char* name_method = (button == 2) ? "CUDA Force" : (button == 3) ? "CUDA Tile" : "OpenMP";
-    const char* state_str = isPaused ? " [PAUSED]" : "";
-    char res[140];
-    std::snprintf(res, sizeof(res), APP_TITLE " | Method: %s | Speed: %.2fx | FPS: %.3f%s",
-        name_method, simSpeed, fps, state_str);
-    glfwSetWindowTitle(window, res);
+    // При смене направления прокрутки мягко гасим противоположный импульс
+    if ((yoffset > 0 && warp_target < 0.0) || (yoffset < 0 && warp_target > 0.0)) {
+        warp_target *= 0.25;
+    }
+    // Один щелчок дает мягкий импульс (0.20), а быстрая прокрутка разгоняет до 1.0 (99.99999% c)
+    warp_target = std::clamp(warp_target + yoffset * 0.20, -1.0, 1.0);
 }
 
 void keyboardPressed(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action == GLFW_PRESS || action == GLFW_REPEAT) {
         if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {
-            // До 1.0x идем с шагом 0.10, выше 1.0x — с шагом 0.25
             float step = (simSpeed < 1.0f) ? 0.10f : 0.25f;
             simSpeed = std::round((simSpeed + step) * 100.0f) / 100.0f;
             if (simSpeed > 10.0f) simSpeed = 10.0f;
             updateWindowTitle();
         }
         else if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) {
-            // Выше 1.0x идем с шагом 0.25, от 1.0x и ниже — с шагом 0.10
             float step = (simSpeed > 1.0f) ? 0.25f : 0.10f;
             simSpeed = std::round((simSpeed - step) * 100.0f) / 100.0f;
             if (simSpeed < 0.10f) simSpeed = 0.10f;
@@ -164,7 +220,7 @@ void keyboardPressed(GLFWwindow* window, int key, int scancode, int action, int 
             break;
         case GLFW_KEY_0:
         case GLFW_KEY_KP_0:
-            simSpeed = 1.0f; // Мгновенный сброс скорости в 1.00x
+            simSpeed = 1.0f;
             updateWindowTitle();
             break;
         case GLFW_KEY_SPACE:
@@ -243,38 +299,33 @@ VkDeviceSize helperCreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkM
 
 void createVertexBuffer() {
     cpuPositions.clear(); cpuColors.clear();
-    cpuPositions.reserve(N + 200); cpuColors.reserve(N + 200);
-
-    int N_large = (N * 3) / 4;
-    int bulgeLarge = N_large / 5;
-    int bulgeSmall = (N - N_large) / 5;
+    cpuPositions.reserve(N + 800); cpuColors.reserve(N + 800);
 
     for (int i = 0; i < N; i++) {
         cpuPositions.push_back({ POSX[i], POSY[i], POSZ[i] });
-
-        if (i < N_large) {
-            if (i < bulgeLarge)
-                cpuColors.push_back({ 1.0f, 0.85f, 0.45f });
-            else
-                cpuColors.push_back({ 0.55f, 0.80f, 1.0f });
-        }
-        else {
-            if (i - N_large < bulgeSmall)
-                cpuColors.push_back({ 1.0f, 0.70f, 0.35f });
-            else
-                cpuColors.push_back({ 0.75f, 0.95f, 0.90f });
-        }
+        float r, g, b;
+        getStarColor(i, r, g, b);
+        cpuColors.push_back({ r, g, b });
     }
 
     const float AXIS_LENGTH = 3800.0f; const float AXIS_OFFSET = 2000.0f;
-    const float MARKER_SIZE = 100.0f; const float MARKER_STEP = 500.0f;
+    const float MARKER_SIZE = 100.0f;  const float MARKER_STEP = 500.0f;
+    const int   AXIS_SEGS = 80; // Разбиваем оси на 80 сегментов, чтобы они плавно изгибались при сжатии/расширении пространства
 
-    cpuPositions.push_back({ -AXIS_LENGTH, -AXIS_OFFSET, -AXIS_OFFSET }); cpuColors.push_back({ 1.0f, 0.0f, 0.0f });
-    cpuPositions.push_back({ AXIS_LENGTH, -AXIS_OFFSET, -AXIS_OFFSET });  cpuColors.push_back({ 1.0f, 0.0f, 0.0f });
-    cpuPositions.push_back({ -AXIS_OFFSET, -AXIS_LENGTH, -AXIS_OFFSET }); cpuColors.push_back({ 0.0f, 1.0f, 0.0f });
-    cpuPositions.push_back({ -AXIS_OFFSET, AXIS_LENGTH, -AXIS_OFFSET });  cpuColors.push_back({ 0.0f, 1.0f, 0.0f });
-    cpuPositions.push_back({ -AXIS_OFFSET, -AXIS_OFFSET, -AXIS_LENGTH }); cpuColors.push_back({ 0.0f, 0.0f, 1.0f });
-    cpuPositions.push_back({ -AXIS_OFFSET, -AXIS_OFFSET, AXIS_LENGTH });  cpuColors.push_back({ 0.0f, 0.0f, 1.0f });
+    for (int s = 0; s < AXIS_SEGS; s++) {
+        float t0 = -AXIS_LENGTH + (2.0f * AXIS_LENGTH * s) / AXIS_SEGS;
+        float t1 = -AXIS_LENGTH + (2.0f * AXIS_LENGTH * (s + 1)) / AXIS_SEGS;
+
+        // Ось X (красная)
+        cpuPositions.push_back({ t0, -AXIS_OFFSET, -AXIS_OFFSET }); cpuColors.push_back({ 1.0f, 0.0f, 0.0f });
+        cpuPositions.push_back({ t1, -AXIS_OFFSET, -AXIS_OFFSET }); cpuColors.push_back({ 1.0f, 0.0f, 0.0f });
+        // Ось Y (зеленая)
+        cpuPositions.push_back({ -AXIS_OFFSET, t0, -AXIS_OFFSET }); cpuColors.push_back({ 0.0f, 1.0f, 0.0f });
+        cpuPositions.push_back({ -AXIS_OFFSET, t1, -AXIS_OFFSET }); cpuColors.push_back({ 0.0f, 1.0f, 0.0f });
+        // Ось Z (синяя)
+        cpuPositions.push_back({ -AXIS_OFFSET, -AXIS_OFFSET, t0 }); cpuColors.push_back({ 0.0f, 0.0f, 1.0f });
+        cpuPositions.push_back({ -AXIS_OFFSET, -AXIS_OFFSET, t1 }); cpuColors.push_back({ 0.0f, 0.0f, 1.0f });
+    }
 
     for (float pos = -AXIS_LENGTH + MARKER_STEP; pos < AXIS_LENGTH; pos += MARKER_STEP) {
         if (fabs(pos) < 0.1f) continue;
@@ -388,7 +439,30 @@ void drawFrame() {
     static auto lastTime = std::chrono::high_resolution_clock::now();
     auto currentTime = std::chrono::high_resolution_clock::now();
     float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
-    lastTime = currentTime; time_f += deltaTime * 1000.0f;
+    lastTime = currentTime;
+    time_f += deltaTime * 1000.0f;
+
+    float dt = std::min(deltaTime, 0.1f);
+
+    // Плавная логарифмическая интерполяция зума (одинаково гладкая на любых дистанциях)
+    view_zoom += (target_zoom - view_zoom) * std::min(1.0f, dt * 12.0f);
+
+    // Плавный разгон текущих скоростей к целевым (убирает рывок в момент щелчка колеса)
+    double smoothRate = std::min(1.0, (double)dt * 10.0);
+    warp_drive += (warp_target - warp_drive) * smoothRate;
+    rot_vel_x += (rot_target_x - rot_vel_x) * smoothRate;
+    rot_vel_y += (rot_target_y - rot_vel_y) * smoothRate;
+
+    // Экспоненциальное затухание целевого импульса после остановки колеса/мыши
+    warp_target *= std::exp(-dt * 2.2);
+    rot_target_x *= std::exp(-dt * 4.0);
+    rot_target_y *= std::exp(-dt * 4.0);
+
+    if (std::fabs(warp_drive) < 0.002 && std::fabs(warp_target) < 0.002) warp_drive = 0.0;
+    if (std::fabs(rot_vel_x) < 0.002 && std::fabs(rot_target_x) < 0.002) rot_vel_x = 0.0;
+    if (std::fabs(rot_vel_y) < 0.002 && std::fabs(rot_target_y) < 0.002) rot_vel_y = 0.0;
+
+    recalculateRelativity();
 
     if (time_f - timebase >= 1000.0f) {
         fps = frames * 1000.0f / (time_f - timebase); timebase = time_f; frames = 0;
