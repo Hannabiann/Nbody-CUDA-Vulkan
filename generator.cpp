@@ -122,11 +122,11 @@ static void spawnRealisticGalaxy(
                 pMass = bulgeStarMass * (0.9f + 0.2f * dist_u(gen));
             }
 
-            // Цвет балджа: от раскаленного бело-желтого в самом центре до глубокого янтарного
+            // Цвет балджа: от яркого золотисто-желтого в центре до глубокого янтарного
             float r_norm = std::min(1.0f, std::sqrt(x_local * x_local + z_local * z_local) / barLength);
             cr = 1.0f;
-            cg = 0.88f - 0.25f * r_norm + dist_norm(gen) * 0.04f;
-            cb = 0.60f - 0.35f * r_norm + dist_norm(gen) * 0.04f;
+            cg = 0.78f - 0.24f * r_norm + dist_norm(gen) * 0.04f;
+            cb = 0.24f - 0.16f * r_norm + dist_norm(gen) * 0.03f;
         }
         else if (i < bulgeCount + haloCount) {
             // --- 2. СФЕРИЧЕСКОЕ ГАЛО И ШАРОВЫЕ СКОПЛЕНИЯ ---
